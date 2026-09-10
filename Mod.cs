@@ -93,7 +93,7 @@ namespace FriendlyItemEnchants
         private static readonly MethodInfo DoSpellEffectsMethod = AccessTools.Method(
             typeof(WorldObject),
             "DoSpellEffects",
-            new[] { typeof(Spell), typeof(WorldObject), typeof(WorldObject) });
+            new[] { typeof(Spell), typeof(WorldObject), typeof(WorldObject), typeof(bool) });
 
         public static bool IsFriendlyImpenBaneForOtherPlayer(WorldObject caster, Spell spell, WorldObject target, out Player targetPlayer)
         {
@@ -107,10 +107,29 @@ namespace FriendlyItemEnchants
                 && spell.IsBeneficial;
         }
 
+        public static bool IsItemDispelForPlayerItems(Spell spell, WorldObject target, out Player targetPlayer)
+        {
+            targetPlayer = target as Player;
+            return Mod.Config.Enabled
+                && Mod.Config.AllowItemDispelsOnPlayersEquippedItems
+                && targetPlayer != null
+                && spell != null
+                && (spell.MetaSpellType == SpellType.Dispel || spell.MetaSpellType == SpellType.FellowDispel)
+                && spell.DispelSchool == MagicSchool.ItemEnchantment
+                && spell.Align != DispelType.Negative;
+        }
+
         public static List<WorldObject> GetAffectedItems(Creature target)
         {
             return target.EquippedObjects.Values
                 .Where(item => item.IsEnchantable && IsAllowedTargetItem(item))
+                .ToList();
+        }
+
+        public static List<WorldObject> GetDispelAffectedItems(Creature target)
+        {
+            return target.EquippedObjects.Values
+                .Where(item => item.IsEnchantable && IsAllowedDispelTargetItem(item))
                 .ToList();
         }
 
@@ -122,6 +141,14 @@ namespace FriendlyItemEnchants
             return Mod.Config.AffectArmorAndClothing && item.WeenieType == WeenieType.Clothing;
         }
 
+        public static bool IsAllowedDispelTargetItem(WorldObject item)
+        {
+            if (Mod.Config.ItemDispelsAffectShields && item.IsShield)
+                return true;
+
+            return Mod.Config.ItemDispelsAffectArmorAndClothing && item.WeenieType == WeenieType.Clothing;
+        }
+
         public static void ApplySpellToItem(WorldObject caster, Spell spell, WorldObject item)
         {
             if (HandleCastSpellMethod == null)
@@ -130,12 +157,31 @@ namespace FriendlyItemEnchants
             HandleCastSpellMethod.Invoke(caster, new object[] { spell, item, null, null, false, false, false, 1.0f, null });
         }
 
+        public static int ApplyDispelToItems(WorldObject caster, Spell spell, Player targetPlayer)
+        {
+            var removedCount = 0;
+            var items = GetDispelAffectedItems(targetPlayer);
+
+            foreach (var item in items)
+            {
+                var removeSpells = item.EnchantmentManager.SelectDispel(spell);
+                if (removeSpells.Count == 0)
+                    continue;
+
+                item.EnchantmentManager.Dispel(removeSpells.Select(s => s.Enchantment).ToList());
+                removedCount += removeSpells.Count;
+            }
+
+            SendDispelResult(caster, targetPlayer, spell, removedCount);
+            return removedCount;
+        }
+
         public static void PlayCreatureEffect(WorldObject caster, Spell spell, WorldObject target)
         {
             if (DoSpellEffectsMethod == null)
                 return;
 
-            DoSpellEffectsMethod.Invoke(caster, new object[] { spell, caster, target });
+            DoSpellEffectsMethod.Invoke(caster, new object[] { spell, caster, target, false });
         }
 
         public static void SendFailure(WorldObject caster, Player targetPlayer, Spell spell)
@@ -149,13 +195,51 @@ namespace FriendlyItemEnchants
             if (!targetPlayer.SquelchManager.Squelches.Contains(caster, ChatMessageType.Magic))
                 targetPlayer.Session.Network.EnqueueSend(new GameMessageSystemChat($"{caster.Name} fails to affect you with {spell.Name}", ChatMessageType.Magic));
         }
+
+        public static void SendDispelResult(WorldObject caster, Player targetPlayer, Spell spell, int removedCount)
+        {
+            if (!Mod.Config.NotifyOnFailure && removedCount == 0)
+                return;
+
+            var suffix = removedCount > 0
+                ? $" and dispel {removedCount} equipped item enchantment{(removedCount == 1 ? "" : "s")}."
+                : ", but the dispel fails.";
+
+            if (caster is Player player)
+            {
+                var targetName = player == targetPlayer ? "your equipped items" : $"{targetPlayer.Name}'s equipped items";
+                player.Session.Network.EnqueueSend(new GameMessageSystemChat($"You cast {spell.Name} on {targetName}{suffix}", ChatMessageType.Magic));
+            }
+
+            if (targetPlayer != caster && !targetPlayer.SquelchManager.Squelches.Contains(caster, ChatMessageType.Magic))
+                targetPlayer.Session.Network.EnqueueSend(new GameMessageSystemChat($"{caster.Name} casts {spell.Name} on your equipped items{suffix.Replace("and dispel", "and dispels")}", ChatMessageType.Magic));
+        }
     }
 
+    [HarmonyPatch(typeof(WorldObject), "HandleCastSpell_Dispel")]
+    internal static class HandleCastSpellDispelPatch
+    {
+        private static bool Prefix(WorldObject __instance, Spell spell, WorldObject target)
+        {
+            if (!FriendlyItemEnchantHelpers.IsItemDispelForPlayerItems(spell, target, out var targetPlayer))
+                return true;
+
+            FriendlyItemEnchantHelpers.ApplyDispelToItems(__instance, spell, targetPlayer);
+            return false;
+        }
+    }
     [HarmonyPatch(typeof(WorldObject), "TryCastSpell_WithRedirects")]
     internal static class TryCastSpellWithRedirectsPatch
     {
         private static bool Prefix(WorldObject __instance, Spell spell, WorldObject target, WorldObject itemCaster, WorldObject weapon, bool isWeaponSpell, bool fromProc, bool tryResist, ref bool __result)
         {
+            if (FriendlyItemEnchantHelpers.IsItemDispelForPlayerItems(spell, target, out _))
+            {
+                __instance.TryCastSpell(spell, target, itemCaster, weapon, isWeaponSpell, fromProc, tryResist);
+                __result = true;
+                return false;
+            }
+
             if (!FriendlyItemEnchantHelpers.IsFriendlyImpenBaneForOtherPlayer(__instance, spell, target, out _))
                 return true;
 
@@ -170,6 +254,12 @@ namespace FriendlyItemEnchants
     {
         private static bool Prefix(WorldObject __instance, Spell spell, WorldObject target, WorldObject itemCaster)
         {
+            if (FriendlyItemEnchantHelpers.IsItemDispelForPlayerItems(spell, target, out _))
+            {
+                __instance.TryCastSpell(spell, target, itemCaster);
+                return false;
+            }
+
             if (!FriendlyItemEnchantHelpers.IsFriendlyImpenBaneForOtherPlayer(__instance, spell, target, out var targetPlayer))
                 return true;
 

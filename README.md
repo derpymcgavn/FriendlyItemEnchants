@@ -30,9 +30,14 @@ Mods\FriendlyItemEnchants\FriendlyItemEnchants.json
   "enabled": true,
   "affectArmorAndClothing": true,
   "affectShields": true,
+  "allowItemDispelsOnPlayersEquippedItems": false,
+  "itemDispelsAffectArmorAndClothing": true,
+  "itemDispelsAffectShields": false,
   "preserveHarmfulRetailBehavior": true,
   "notifyOnFailure": true
 }
 ```
+
+Set `allowItemDispelsOnPlayersEquippedItems` to `true` to let positive Item Magic dispels, such as Evaporate Item Magic, target a player and remove matching enchantments from their equipped items instead of the player object. By default this affects armor/clothing only and leaves shield enchantments alone; set `itemDispelsAffectShields` to `true` if shield enchantments should also be dispellable through this redirect.
 
 `preserveHarmfulRetailBehavior` is intentionally present as a guardrail. This mod does not widen harmful item spell targeting.
